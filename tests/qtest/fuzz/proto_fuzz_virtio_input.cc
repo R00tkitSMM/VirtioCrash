@@ -2,6 +2,8 @@
 
 #include <glib.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -37,6 +39,8 @@ void fuzz_add_target(const FuzzTarget *target);
 
 namespace {
 constexpr uint64_t kVirtioMmioBase = 0x0a003e00ULL;
+constexpr uint64_t kExoticGpaBase = 0x09000000ULL; /* PL011 UART, non-RAM MMIO */
+constexpr uint32_t kExoticGpaSize = 0x1000;
 enum : uint64_t {
     R_DEV_FEATURES=0x010, R_DEV_FEATURES_SEL=0x014,
     R_DRV_FEATURES=0x020, R_DRV_FEATURES_SEL=0x024,
@@ -59,7 +63,8 @@ struct Vq { uint64_t desc_gpa, avail_gpa, used_gpa;
             uint32_t size, next_desc_idx, next_avail_idx; };
 struct G { QTestState* qts; Vq vqs[kMaxQueues]={};
            uint64_t buf_alloc; std::unordered_map<uint32_t,Buf> bufs;
-           uint32_t synth_buf_id; } g;
+           uint32_t synth_buf_id; };
+thread_local G g;
 inline uint32_t mr(uint64_t off) { return qtest_readl(g.qts, kVirtioMmioBase+off); }
 inline void     mw(uint64_t off, uint32_t v) { qtest_writel(g.qts, kVirtioMmioBase+off, v); }
 
@@ -214,11 +219,22 @@ void dispatch(const qemu::fuzz::input::VirtioOp& op) {
         const auto& d = op.vq_add_desc();
         if (d.vq_idx() >= kMaxQueues) break;
         if (g.vqs[d.vq_idx()].size == 0) break;
-        auto it = g.bufs.find(d.buf_id());
-        if (it == g.bufs.end()) break;
-        uint32_t dl = std::min<uint32_t>(d.len(), it->second.len);
-        if (!dl) dl = 1;
-        place_desc(d.vq_idx(), it->second.gpa, dl, d.device_writable(), d.chain_next());
+        uint64_t gpa; uint32_t dl;
+        if (d.exotic_region() != 0) {
+            const uint64_t bases[4] = {
+                0x09000000ULL, kVirtioMmioBase, 0x08000000ULL, 0x0a000000ULL };
+            const uint32_t sizes[4] = { 0x1000, 0x200, 0x10000, 0x3e00 };
+            uint32_t ri = (d.exotic_region() - 1) % 4;
+            gpa = bases[ri] + (d.buf_id() % (sizes[ri] / 4)) * 4;
+            dl = std::max<uint32_t>(std::min<uint32_t>(d.len(), 4u), 1u);
+        } else {
+            auto it = g.bufs.find(d.buf_id());
+            if (it == g.bufs.end()) break;
+            gpa = it->second.gpa;
+            dl = std::min<uint32_t>(d.len(), it->second.len);
+            if (!dl) dl = 1;
+        }
+        place_desc(d.vq_idx(), gpa, dl, d.device_writable(), d.chain_next());
         break;
     }
     case V::kVqKick: mw(R_QUEUE_NOTIFY, op.vq_kick().vq_idx()); break;
@@ -250,17 +266,30 @@ void run(QTestState* qts, const unsigned char* data, size_t size) {
             dispatch(op);
         }
     } else {
-        uint32_t iter = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 8);
-        int bsz = prog.ops_thread_b_size(), bidx = 0;
+        QTestState* shared_qts = g.qts;
+        constexpr uint64_t kBufPoolMid =
+            kBufPoolBase + (kBufPoolEnd - kBufPoolBase) / 2;
+        uint32_t iter = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 100);
+        int bsz = prog.ops_thread_b_size();
+        std::atomic<bool> b_stop{false};
+
+        std::thread thread_b([&]() {
+            g.qts  = shared_qts;
+            g.buf_alloc = kBufPoolMid;
+            for (uint32_t i = 0;
+                 i < iter && !b_stop.load(std::memory_order_relaxed); ++i) {
+                for (int j = 0; j < bsz; ++j)
+                    dispatch(prog.ops_thread_b(j));
+            }
+        });
+
         for (const auto& op : prog.ops()) {
             if (n++ >= kMaxOps) break;
             dispatch(op);
-            for (uint32_t i = 0; i < iter; ++i) {
-                if (n++ >= kMaxOps) break;
-                dispatch(prog.ops_thread_b(bidx));
-                bidx = (bidx + 1) % bsz;
-            }
         }
+
+        b_stop.store(true, std::memory_order_relaxed);
+        thread_b.join();
     }
 }
 

@@ -1282,3 +1282,146 @@ of any seed that contains a `ctrl_cmd` op.
   always include `-global virtio-mmio.force-legacy=false` on day
   one.
 
+---
+
+## 14. DMA reentrancy and the `exotic_region` field
+
+### The attack class
+
+A virtio device processes a descriptor chain by reading or writing the
+guest physical addresses (GPAs) stored in each descriptor. If the
+harness points a descriptor at *MMIO space* instead of DRAM, the
+device's DMA walk lands inside its own register file. For virtio-mmio
+on arm-virt this creates a re-entrancy path:
+
+```text
+VqKick
+  → virtio_mmio_write(QUEUE_NOTIFY)
+      → virtio_queue_notify()
+          → walk descriptor chain
+              → address_space_write(gpa=kVirtioMmioBase+0x050)
+                    ↑                   ↓
+                    |      virtio_mmio_write(QUEUE_NOTIFY)
+                    |          → virtio_queue_notify()
+                    |              → walk descriptor chain (again)
+                    +-------------------------------------------
+```
+
+Two concrete exploit primitives from this surface (Black Hat Asia 2022,
+"Recursive MMIO Flaws in QEMU"):
+
+**Reset gadget UAF** — a descriptor pointing at `STATUS` (offset
+0x070). The device DMA-writes 0 into Status →
+`virtio_mmio_soft_reset()` fires while the device is mid-chain. Queue
+state is freed but the chain walk continues using the freed pointers.
+
+**Recursive notify** — a chain of N descriptors each pointing at
+`QUEUE_NOTIFY` (offset 0x050). Each DMA write re-kicks the same queue,
+scheduling another bottom-half. A deep enough chain exhausts QEMU's
+reentrancy guard or overflows the call stack.
+
+All addresses used are from the QEMU source tree, not the conference
+slides:
+
+| Region | GPA | Source file | Symbol |
+|--|--|--|--|
+| virtio-mmio bus | `0x0a000000` | `hw/arm/virt.c` `base_memmap[]` | `VIRT_MMIO` |
+| virtio-mmio slot 31 | `0x0a003e00` | above + `i=31`, step=0x200 | single-device landing slot |
+| UART0 / PL011 | `0x09000000` | `hw/arm/virt.c` `base_memmap[]` | `VIRT_UART0` |
+| GIC distributor | `0x08000000` | `hw/arm/virt.c` `base_memmap[]` | `VIRT_GIC_DIST` |
+
+arm-virt fills virtio-mmio slots **high-address-first**, so a single
+`-device virtio-*-device` always lands at slot 31 = `0x0a003e00`.
+
+### The proto field
+
+```protobuf
+message VqAddDesc {
+  uint32 vq_idx          = 1;
+  uint32 buf_id          = 2;
+  uint32 len             = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+  uint32 exotic_region   = 6;  // 0=DRAM (default), 1=UART0, 2=virtio-mmio, 3=GIC
+}
+```
+
+`exotic_region = 0` is the default: the descriptor GPA is
+`kBufPoolBase + buf_id_index * 4` (DRAM buffer pool). For a non-zero
+value the harness maps `buf_id` into the chosen region:
+
+```
+region 1 → gpa = 0x09000000 + (buf_id % (0x1000 / 4)) * 4   (UART0, 4 KB window)
+region 2 → gpa = 0x0a003e00 + (buf_id % (0x200  / 4)) * 4   (virtio-mmio, 512 B window)
+region 3 → gpa = 0x08000000 + (buf_id % (0x10000/ 4)) * 4   (GIC dist, 64 KB window)
+```
+
+For region 2, `buf_id % 128` selects a 4-byte-aligned offset in the
+512-byte virtio-mmio register window. The `.cc` files carry an inline
+comment listing every interesting offset:
+
+| buf_id | offset | register | effect if DMA-written |
+|--|--|--|--|
+| 0 | 0x000 | MAGIC_VALUE | read-only; write ignored |
+| 17 | 0x044 | QUEUE_READY | write 0 → disables queue mid-flight |
+| 20 | 0x050 | QUEUE_NOTIFY | BH re-kick → recursive chain walk |
+| 25 | 0x064 | INTERRUPT_ACK | clears pending interrupt |
+| 28 | 0x070 | STATUS | write 0 → `virtio_mmio_soft_reset` → UAF |
+| 32 | 0x080 | QUEUE_DESC_LOW | corrupts descriptor table GPA |
+| 33 | 0x084 | QUEUE_DESC_HIGH | upper 32 bits of descriptor table GPA |
+| 36 | 0x090 | QUEUE_AVAIL_LOW | corrupts avail ring GPA |
+| 40 | 0x0a0 | QUEUE_USED_LOW | corrupts used ring GPA |
+
+Register offsets are from
+`include/standard-headers/linux/virtio_mmio.h` in the QEMU source tree.
+
+### Seed structure
+
+Each corpus generator emits five DMA reentrancy seeds. The `vq_idx`
+matches each target's primary queue, but the seed shape is otherwise
+identical across all 10 devices.
+
+```protobuf
+# seed_dma_reset_gadget.textpb
+# Chain: read (buf 0) → STATUS write (buf 28) → tail (buf 0).
+# DMA-write 0 into STATUS while mid-chain → soft_reset → UAF.
+ops { get_features {} }
+ops { set_features { features: 4294967296 } }
+ops { vq_setup { vq_idx: 0 size: 64 } }
+ops { set_status { bits: 4 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 0  len: 4 device_writable: false chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 28 len: 4 device_writable: true  chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 0  len: 4 device_writable: true  chain_next: false exotic_region: 2 } }
+ops { vq_kick { vq_idx: 0 } }
+```
+
+```protobuf
+# seed_dma_recursive_notify.textpb
+# 9-deep chain all pointing at QUEUE_NOTIFY (buf_id=20 → offset 0x050).
+# Each DMA write re-kicks the queue → recursive bottom-half scheduling.
+ops { get_features {} }
+ops { set_features { features: 4294967296 } }
+ops { vq_setup { vq_idx: 0 size: 64 } }
+ops { set_status { bits: 4 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: true  exotic_region: 2 } }
+ops { vq_add_desc { vq_idx: 0 buf_id: 20 len: 4 device_writable: true chain_next: false exotic_region: 2 } }
+ops { vq_kick { vq_idx: 0 } }
+```
+
+### Why this matters for coverage
+
+Without `exotic_region` the harness can only explore bugs that are
+reachable when descriptors point into DRAM. The reentrancy paths in
+`virtio_mmio_write` and `virtio_queue_notify` -- the paths where a
+mid-chain register write modifies shared device state -- are unreachable
+from normal DRAM buffers, because `address_space_write` to DRAM never
+calls back into the virtio-mmio handler. With `exotic_region = 2`
+those code paths become first-class fuzz targets.
+

@@ -285,16 +285,70 @@ No build errors, no crashes, all 10 proto-fuzz targets register correctly.
 
 | Target name                  | Device          | Highlights |
 |--|--|--|
-| `proto-fuzz-virtio-blk`      | virtio-blk      | TOCTOU / stale-descriptor mode, mmio + DMA fault injection |
-| `proto-fuzz-virtio-net`      | virtio-net      | typed CVQ commands, RSS, host-side `qmp_set_link`, VLAN tag insert |
-| `proto-fuzz-virtio-gpu`      | virtio-gpu      | slot-keyed resources, blob resources, fence state, console hotplug |
-| `proto-fuzz-virtio-scsi`     | virtio-scsi     | typed CDBs (INQUIRY/READ_CAP/READ/WRITE/MODE_SENSE/REPORT_LUNS/...), TMF + AN on the control queue, raw-CDB escape hatch |
-| `proto-fuzz-virtio-fs`       | vhost-user-fs   | in-process mock vhost-user backend, typed FUSE requests (INIT/LOOKUP/GETATTR/OPEN/READ/WRITE/xattr/IOCTL/...), HP-queue forget. **Linux only** -- macOS builds don't include `vhost-user-fs-device`. |
-| `proto-fuzz-virtio-snd`      | virtio-sound    | typed control commands (JACK_INFO, PCM_INFO/SET_PARAMS/PREPARE/START/STOP/RELEASE, CHMAP_INFO), TX/RX PCM data transfers, raw-CTRL escape hatch |
-| `proto-fuzz-virtio-vsock`    | vhost-vsock     | typed packets (REQUEST/RESPONSE/RST/SHUTDOWN/RW/CREDIT_*), STREAM/DGRAM/SEQPACKET, RX-buffer staging. **Linux only** (needs `/dev/vhost-vsock`). |
-| `proto-fuzz-virtio-console`  | virtio-serial   | multi-port TX/RX, control-queue events (PORT_READY/OPEN/RESIZE/PORT_NAME), 2 ports preconfigured |
-| `proto-fuzz-virtio-input`    | virtio-keyboard | status-queue events (LED, REP), event-queue buffer staging, config-space probing |
-| `proto-fuzz-virtio-balloon`  | virtio-balloon  | inflate/deflate PFN lists, stats blobs (free/total/avail/caches/...), free-page-hint cmd_id |
+| `proto-fuzz-virtio-blk`      | virtio-blk      | TOCTOU / stale-descriptor mode, mmio + DMA fault injection, DMA reentrancy seeds (reflection / reset-gadget UAF / recursive-notify), concurrent thread_b mode |
+| `proto-fuzz-virtio-net`      | virtio-net      | typed CVQ commands, RSS, host-side `qmp_set_link`, VLAN tag insert, DMA reentrancy seeds |
+| `proto-fuzz-virtio-gpu`      | virtio-gpu      | slot-keyed resources, blob resources, fence state, console hotplug, DMA reentrancy seeds |
+| `proto-fuzz-virtio-scsi`     | virtio-scsi     | typed CDBs (INQUIRY/READ_CAP/READ/WRITE/MODE_SENSE/REPORT_LUNS/...), TMF + AN on the control queue, raw-CDB escape hatch, DMA reentrancy seeds |
+| `proto-fuzz-virtio-fs`       | vhost-user-fs   | in-process mock vhost-user backend, typed FUSE requests (INIT/LOOKUP/GETATTR/OPEN/READ/WRITE/xattr/IOCTL/...), HP-queue forget, DMA reentrancy seeds. **Linux only** -- macOS builds don't include `vhost-user-fs-device`. |
+| `proto-fuzz-virtio-snd`      | virtio-sound    | typed control commands (JACK_INFO, PCM_INFO/SET_PARAMS/PREPARE/START/STOP/RELEASE, CHMAP_INFO), TX/RX PCM data transfers, raw-CTRL escape hatch, DMA reentrancy seeds |
+| `proto-fuzz-virtio-vsock`    | vhost-vsock     | typed packets (REQUEST/RESPONSE/RST/SHUTDOWN/RW/CREDIT_*), STREAM/DGRAM/SEQPACKET, RX-buffer staging, DMA reentrancy seeds. **Linux only** (needs `/dev/vhost-vsock`). |
+| `proto-fuzz-virtio-console`  | virtio-serial   | multi-port TX/RX, control-queue events (PORT_READY/OPEN/RESIZE/PORT_NAME), 2 ports preconfigured, DMA reentrancy seeds |
+| `proto-fuzz-virtio-input`    | virtio-keyboard | status-queue events (LED, REP), event-queue buffer staging, config-space probing, DMA reentrancy seeds |
+| `proto-fuzz-virtio-balloon`  | virtio-balloon  | inflate/deflate PFN lists, stats blobs (free/total/avail/caches/...), free-page-hint cmd_id, DMA reentrancy seeds |
+
+## DMA reentrancy
+
+All 10 corpus generators ship five DMA reentrancy seeds in addition to
+device-specific seeds. These exercise a class of bugs where the device
+DMA-walks a descriptor whose buffer GPA points into MMIO space instead
+of DRAM, causing the device to re-enter its own register handler
+while still processing the current chain. This pattern was documented
+in the Black Hat Asia 2022 talk "Recursive MMIO Flaws in QEMU".
+
+### exotic_region field
+
+`VqAddDesc` has an optional `exotic_region` field that controls where
+the descriptor's buffer GPA lands:
+
+| value | buffer GPA | region |
+|--|--|--|
+| 0 (default) | DRAM buffer pool (0x47…) | normal data buffer |
+| 1 | UART0 / PL011 (0x09000000) | peripheral register fault injection |
+| 2 | virtio-mmio self (0x0a003e00) | **DMA self-reflection / reentrancy** |
+| 3 | GIC distributor (0x08000000) | interrupt-controller register fault |
+
+All base addresses come from `hw/arm/virt.c base_memmap[]` in the QEMU
+source tree, not from conference slides. `0x0a003e00` is slot 31
+(`base + 31 × 0x200`) because arm-virt fills MMIO slots
+high-address-first; a single device always lands at slot 31.
+
+For `exotic_region = 2`, `buf_id % 128` selects a 4-byte-aligned offset
+inside the 512-byte virtio-mmio window. Key offsets (from
+`include/standard-headers/linux/virtio_mmio.h`):
+
+| buf_id | register offset | register | reentrancy effect |
+|--|--|--|--|
+| 17 | 0x044 | QUEUE_READY | write 0 disables queue mid-flight |
+| 20 | 0x050 | QUEUE_NOTIFY | BH re-kick → recursive chain walk |
+| 25 | 0x064 | INTERRUPT_ACK | clears interrupt mid-processing |
+| 28 | 0x070 | STATUS | write 0 → `virtio_mmio_soft_reset` → UAF |
+| 32 | 0x080 | QUEUE_DESC_LOW | corrupts descriptor table pointer |
+| 36 | 0x090 | QUEUE_AVAIL_LOW | corrupts avail ring pointer |
+| 40 | 0x0a0 | QUEUE_USED_LOW | corrupts used ring pointer |
+
+### Seed families (all 10 generators)
+
+| Seed file | buf_id / register | Attack class |
+|--|--|--|
+| `seed_dma_reflection.textpb` | 5 / DeviceFeaturesSel | basic DMA self-reference |
+| `seed_dma_all_regions.textpb` | regions 1–3 | all four DMA target regions |
+| `seed_dma_reflection_concurrent.textpb` | region 2 | DMA reflection + concurrent thread_b ops |
+| `seed_dma_reset_gadget.textpb` | 28 / STATUS (0x070) | DMA-write 0 → `soft_reset` → UAF |
+| `seed_dma_recursive_notify.textpb` | 20 / QUEUE_NOTIFY (0x050) | 9-deep kick chain → recursion guard / stack overflow |
+
+See ARCHITECTURE.md Section 14 for the full design and seed structure.
+
+---
 
 **Not in upstream QEMU:** `virtio-video` -- exists only in out-of-tree forks
 (Cloud Hypervisor, vendor branches). Not shipped here.

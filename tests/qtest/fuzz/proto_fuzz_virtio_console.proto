@@ -34,6 +34,7 @@ message VqAddDesc {
   uint32 len    = 3;
   bool   device_writable = 4;
   bool   chain_next      = 5;
+  uint32 exotic_region   = 6;   // 0=RAM pool; 1=UART; 2=own-MMIO (Reflection); 3=GIC; 4=virt-mmio-bus (Refraction)
 }
 message VqKick     { uint32 vq_idx = 1; }
 message VqWaitUsed { uint32 vq_idx = 1; }

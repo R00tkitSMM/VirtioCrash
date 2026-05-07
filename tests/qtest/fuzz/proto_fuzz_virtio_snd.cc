@@ -10,6 +10,8 @@
 #include <glib.h>
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -68,6 +70,8 @@ void fuzz_add_target(const FuzzTarget *target);
 namespace {
 
 constexpr uint64_t kVirtioMmioBase = 0x0a003e00ULL;
+constexpr uint64_t kExoticGpaBase = 0x09000000ULL; /* PL011 UART, non-RAM MMIO */
+constexpr uint32_t kExoticGpaSize = 0x1000;
 
 enum : uint64_t {
     R_DEV_FEATURES     = 0x010, R_DEV_FEATURES_SEL = 0x014,
@@ -125,7 +129,8 @@ struct GlobalState {
     uint64_t    buf_alloc;
     std::unordered_map<uint32_t, Buf> bufs;
     uint32_t    synth_buf_id;
-} g_state;
+};
+thread_local GlobalState g_state;
 
 inline uint32_t mmio_readl(uint64_t off) {
     return qtest_readl(g_state.qts, kVirtioMmioBase + off);
@@ -224,15 +229,27 @@ uint32_t place_desc(uint32_t vq_idx, uint64_t addr, uint32_t len,
 }
 
 void op_vq_add_desc(uint32_t vq_idx, uint32_t buf_id, uint32_t len,
-                    bool device_writable, bool chain_next) {
+                    bool device_writable, bool chain_next,
+                    uint32_t exotic_region) {
     if (vq_idx >= kMaxQueues) return;
     if (g_state.vqs[vq_idx].size == 0) return;
-    auto it = g_state.bufs.find(buf_id);
-    if (it == g_state.bufs.end()) return;
-    const Buf& buf = it->second;
-    uint32_t dlen = std::min(len, buf.len);
-    if (dlen == 0) dlen = 1;
-    place_desc(vq_idx, buf.gpa, dlen, device_writable, chain_next);
+    uint64_t gpa; uint32_t dlen;
+    if (exotic_region != 0) {
+        const uint64_t bases[4] = {
+            0x09000000ULL, kVirtioMmioBase, 0x08000000ULL, 0x0a000000ULL };
+        const uint32_t sizes[4] = { 0x1000, 0x200, 0x10000, 0x3e00 };
+        uint32_t ri = (exotic_region - 1) % 4;
+        gpa  = bases[ri] + (buf_id % (sizes[ri] / 4)) * 4;
+        dlen = std::max(std::min(len, 4u), 1u);
+    } else {
+        auto it = g_state.bufs.find(buf_id);
+        if (it == g_state.bufs.end()) return;
+        const Buf& buf = it->second;
+        gpa  = buf.gpa;
+        dlen = std::min(len, buf.len);
+        if (dlen == 0) dlen = 1;
+    }
+    place_desc(vq_idx, gpa, dlen, device_writable, chain_next);
 }
 
 void op_mem_write_absolute(const qemu::fuzz::snd::MemwriteAbsolute& m) {
@@ -489,7 +506,8 @@ void dispatch(const qemu::fuzz::snd::VirtioOp& op) {
     case VirtioOp::kVqAddDesc: {
         const auto& d = op.vq_add_desc();
         op_vq_add_desc(d.vq_idx(), d.buf_id(), d.len(),
-                       d.device_writable(), d.chain_next());
+                       d.device_writable(), d.chain_next(),
+                       d.exotic_region());
         break;
     }
     case VirtioOp::kVqKick:
@@ -539,19 +557,30 @@ void proto_fuzz_virtio_snd_run(QTestState* qts,
             dispatch(op);
         }
     } else {
-        uint32_t iter = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 8);
-        int      bsz  = prog.ops_thread_b_size();
-        int      bidx = 0;
+        QTestState* shared_qts = g_state.qts;
+        constexpr uint64_t kBufPoolMid =
+            kBufPoolBase + (kBufPoolEnd - kBufPoolBase) / 2;
+        uint32_t iter = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 100);
+        int bsz = prog.ops_thread_b_size();
+        std::atomic<bool> b_stop{false};
+
+        std::thread thread_b([&]() {
+            g_state.qts  = shared_qts;
+            g_state.buf_alloc = kBufPoolMid;
+            for (uint32_t i = 0;
+                 i < iter && !b_stop.load(std::memory_order_relaxed); ++i) {
+                for (int j = 0; j < bsz; ++j)
+                    dispatch(prog.ops_thread_b(j));
+            }
+        });
+
         for (const auto& op : prog.ops()) {
             if (n++ >= kMaxOps) break;
             dispatch(op);
-            for (uint32_t i = 0; i < iter; ++i) {
-                if (n++ >= kMaxOps) break;
-                const auto& bop = prog.ops_thread_b(bidx);
-                bidx = (bidx + 1) % bsz;
-                dispatch(bop);
-            }
         }
+
+        b_stop.store(true, std::memory_order_relaxed);
+        thread_b.join();
     }
 }
 

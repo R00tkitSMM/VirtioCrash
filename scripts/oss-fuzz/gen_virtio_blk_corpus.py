@@ -85,12 +85,27 @@ def op_guest_mem_write(buf_id, data: bytes):
     return ('ops { guest_mem_write { buf_id: %d data: "%s" } }'
             % (buf_id, escape_bytes(data)))
 
-def op_vq_add_desc(vq_idx, buf_id, length, device_writable, chain_next):
-    return ("ops { vq_add_desc { vq_idx: %d buf_id: %d len: %d "
-            "device_writable: %s chain_next: %s } }"
-            % (vq_idx, buf_id, length,
-               'true' if device_writable else 'false',
-               'true' if chain_next else 'false'))
+def op_vq_add_desc(vq_idx, buf_id, length, device_writable, chain_next,
+                   exotic_region=0):
+    s = ("ops { vq_add_desc { vq_idx: %d buf_id: %d len: %d "
+         "device_writable: %s chain_next: %s"
+         % (vq_idx, buf_id, length,
+            'true' if device_writable else 'false',
+            'true' if chain_next else 'false'))
+    if exotic_region:
+        s += " exotic_region: %d" % exotic_region
+    return s + " } }"
+
+def b_vq_add_desc(vq_idx, buf_id, length, device_writable, chain_next,
+                  exotic_region=0):
+    s = ("ops_thread_b { vq_add_desc { vq_idx: %d buf_id: %d len: %d "
+         "device_writable: %s chain_next: %s"
+         % (vq_idx, buf_id, length,
+            'true' if device_writable else 'false',
+            'true' if chain_next else 'false'))
+    if exotic_region:
+        s += " exotic_region: %d" % exotic_region
+    return s + " } }"
 
 def op_vq_kick(vq_idx):
     return "ops { vq_kick { vq_idx: %d } }" % vq_idx
@@ -355,6 +370,186 @@ def seed_config_probe():
             ops, 0)
 
 
+def seed_dma_reflection():
+    """DMA Reflection: the device-writable data buffer descriptor points at
+    the device's own MMIO register space (exotic_region=2).
+
+    When the device DMA-writes the read result into the descriptor buffer,
+    the write lands on a virtio-mmio register, potentially triggering the
+    MMIO write handler while the device is already in its processing path.
+
+    buf_id=20 → QueueNotify (offset 0x050): most dangerous; re-triggers queue
+    buf_id=28 → Status (offset 0x070, reset gadget!): corrupts descriptor table pointer
+    buf_id=28 → Status (offset 0x070): changes device status mid-flight
+    """
+    outhdr = struct.pack("<IIQ", VIRTIO_BLK_T_IN, 0, 0)
+    ops = prologue()
+    ops += [
+        op_guest_mem_write(buf_id=1, data=outhdr),
+        op_guest_mem_write(buf_id=3, data=b"\x00"),
+        op_vq_add_desc(0, 1,  16, False, True),
+        # data desc → own QueueNotify: device DMA-writes → MMIO write → reentrancy
+        op_vq_add_desc(0, 20,  4, True,  True,  exotic_region=2),
+        # chain continuation → own QueueDescLow: corrupts desc table ptr mid-flight
+        op_vq_add_desc(0, 44,  4, True,  True,  exotic_region=2),
+        op_vq_add_desc(0, 3,   1, True,  False),
+        op_vq_kick(0),
+        op_vq_wait_used(0),
+    ]
+    return ("seed_10_dma_reflection.textpb",
+            "DMA Reflection: data-buffer descriptors point at the device's "
+            "own MMIO (exotic_region=2). buf_id=20→QueueNotify, buf_id=28→"
+            "QueueDescLow. Device DMA-writes to its own registers, triggering "
+            "reentrancy. CVE-2024-3446 class.",
+            ops, 0)
+
+
+def seed_dma_all_regions():
+    """One descriptor per exotic GPA region in a single input.
+
+    Region 1 (UART, 0x09000000): device reads/writes hit UART MMIO handler
+    Region 2 (own MMIO / Reflection, kVirtioMmioBase): self-reentrancy
+    Region 3 (GIC distributor, 0x08000000): access to interrupt controller
+    Region 4 (virt-mmio bus slot 0, 0x0a000000): cross-device Refraction stub
+    """
+    outhdr = struct.pack("<IIQ", VIRTIO_BLK_T_IN, 0, 0)
+    ops = prologue()
+    ops += [
+        op_guest_mem_write(buf_id=1, data=outhdr),
+        op_guest_mem_write(buf_id=3, data=b"\x00"),
+        # out-header: device reads from UART MMIO (region 1)
+        op_vq_add_desc(0, 1,  4, False, True,  exotic_region=1),
+        # data: device writes to own QueueNotify (region 2, Reflection)
+        op_vq_add_desc(0, 20, 4, True,  True,  exotic_region=2),
+        # data: device writes to GIC (region 3)
+        op_vq_add_desc(0, 0,  4, True,  True,  exotic_region=3),
+        # data: device writes to virtio-mmio bus slot 0 (region 4, Refraction)
+        op_vq_add_desc(0, 0,  4, True,  False, exotic_region=4),
+        op_vq_kick(0),
+    ]
+    return ("seed_11_dma_all_exotic_regions.textpb",
+            "All four exotic GPA regions in one chain: UART (1), own-MMIO "
+            "Reflection (2), GIC (3), virtio-mmio bus Refraction (4). Ensures "
+            "LPM finds all reentrancy primitives from a single starting point.",
+            ops, 0)
+
+
+def seed_dma_reflection_concurrent():
+    """Concurrent DMA Reflection: thread A submits a reflection-targeted
+    read request; thread B simultaneously fires MMIO writes to the same
+    registers. Produces a true concurrent reentrancy race.
+
+    Thread A: read chain where data descs → QueueNotify + QueueDescLow
+    Thread B: repeated MMIO writes to QueueNotify and Status
+    """
+    outhdr = struct.pack("<IIQ", VIRTIO_BLK_T_IN, 0, 0)
+    primary = prologue()
+    primary += [
+        op_guest_mem_write(buf_id=1, data=outhdr),
+        op_guest_mem_write(buf_id=3, data=b"\x00"),
+        op_vq_add_desc(0, 1,  16, False, True),
+        op_vq_add_desc(0, 20,  4, True,  True,  exotic_region=2),  # → QueueNotify
+        op_vq_add_desc(0, 44,  4, True,  True,  exotic_region=2),  # → QueueDescLow
+        op_vq_add_desc(0, 3,   1, True,  False),
+        op_vq_kick(0),
+        op_vq_wait_used(0),
+    ]
+    secondary = [
+        b_mmio_corrupt(R_QUEUE_NOTIFY, 0),        # concurrent queue kick
+        b_mmio_corrupt(R_STATUS,       0),        # reset status mid-flight
+        b_mem_write_absolute(0x47000000, b"\xcc" * 16),  # corrupt desc table
+        b_mmio_corrupt(R_INT_ACK,      0xffffffff),
+    ]
+    return ("seed_12_dma_reflection_concurrent.textpb",
+            "Concurrent DMA Reflection: thread A reflection chain targeting "
+            "QueueNotify and QueueDescLow; thread B races with MMIO writes to "
+            "the same registers. True concurrent reentrancy race. "
+            "CVE-2024-3446 class.",
+            primary + secondary, 4)
+
+
+def seed_dma_read_exotic():
+    """Device-reads from exotic regions (device_writable=false on exotic desc).
+
+    When the device DMA-reads the request header or data from an MMIO
+    address, the read triggers the MMIO read handler of that device while
+    the original device is processing. Exercises DMA Refraction read paths.
+    """
+    ops = prologue()
+    ops += [
+        # out-header read from own MMIO (Reflection, buf_id=0 → MagicValue reg)
+        op_vq_add_desc(0, 0, 4, False, True,  exotic_region=2),
+        # data read from GIC region
+        op_vq_add_desc(0, 4, 4, False, True,  exotic_region=3),
+        # data read from virt-mmio bus start (Refraction)
+        op_vq_add_desc(0, 0, 4, False, False, exotic_region=4),
+        op_vq_kick(0),
+    ]
+    return ("seed_13_dma_read_exotic.textpb",
+            "DMA-reads from exotic MMIO regions: Reflection (own registers, "
+            "buf_id=0→MagicValue), GIC, Refraction (bus slot 0). Device reads "
+            "from MMIO during request processing → cross-handler reentrancy.",
+            ops, 0)
+
+
+
+def seed_dma_reset_gadget():
+    """Reset-gadget UAF pattern (BH Asia 2022 talk):
+    A descriptor's GPA points at the device's own Status register
+    (exotic_region=2, buf_id=28 → offset 0x070).  When the device
+    DMA-WRITES to that address, if it happens to write 0x00000000,
+    virtio_mmio_soft_reset() fires mid-DMA: queues are freed and state
+    is reset while the DMA code path still holds pointers into it.
+    Any subsequent descriptor access → UAF.
+
+    Chain layout:
+      desc[0]: normal out-header   (device reads request)
+      desc[1]: → Status reg write  (device DMA-write → may trigger reset)
+      desc[2]: normal data buffer  (device uses freed state if reset fired)
+
+    Even without the reset firing, this exercises the MMIO write path
+    for Status with an arbitrary value produced by DMA, which exercises
+    unusual status transitions."""
+    ops = prologue()
+    ops += [
+        # head: device reads from own MagicValue reg (buf_id=0 → 0x000)
+        op_vq_add_desc(0, 0,   4, False, True,  exotic_region=2),
+        # body: device WRITES to own Status register → potential soft-reset
+        op_vq_add_desc(0, 28,  4, True,  True,  exotic_region=2),
+        # tail: device continues with (possibly freed) state → UAF path
+        op_vq_add_desc(0, 0,   4, True,  False, exotic_region=2),
+        "ops { vq_kick { vq_idx: 0 } }",
+    ]
+    return ("seed_dma_reset_gadget.textpb",
+            "Reset-gadget UAF: chain targeting Status register (buf_id=28→0x070). "
+            "DMA-write to Status may fire virtio_mmio_soft_reset() mid-DMA, leaving "
+            "freed queue state in-use. BH Asia 2022 pattern.",
+            ops, 0)
+
+
+def seed_dma_recursive_notify():
+    """Endless-recursion / stack-overflow path (BH Asia 2022 talk):
+    A chain of device-writable descs all pointing at QueueNotify
+    (exotic_region=2, buf_id=20 → offset 0x050).  Each time the
+    device DMA-writes to QueueNotify it schedules another BH for
+    queue processing, potentially creating a deep call stack before
+    QEMU's recursion guard (if any) fires.
+
+    Without a guard: stack overflow (UBSan / ASan / SIGSTKSZ catch).
+    With a guard: exercises the guard exit path and any error handling
+    that follows.  Either way this is high-signal."""
+    ops = prologue()
+    for _ in range(8):
+        ops.append(op_vq_add_desc(0, 20, 4, True, True,  exotic_region=2))
+    ops.append(op_vq_add_desc(0, 20, 4, True, False, exotic_region=2))
+    ops.append("ops { vq_kick { vq_idx: 0 } }")
+    return ("seed_dma_recursive_notify.textpb",
+            "Endless-recursion test: 9-deep chain of descs all targeting "
+            "QueueNotify (buf_id=20 → offset 0x050). Each DMA-write to "
+            "QueueNotify may schedule another BH kick → deep recursion. "
+            "Exercises QEMU recursion guard or triggers stack overflow.",
+            ops, 0)
+
 SEED_BUILDERS = [
     seed_init,
     seed_read_request,
@@ -365,6 +560,12 @@ SEED_BUILDERS = [
     seed_toctou_descriptor_table,
     seed_combined_fault_injection,
     seed_config_probe,
+    seed_dma_reflection,
+    seed_dma_all_regions,
+    seed_dma_reflection_concurrent,
+    seed_dma_read_exotic,
+    seed_dma_reset_gadget,
+    seed_dma_recursive_notify,
 ]
 
 

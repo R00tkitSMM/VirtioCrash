@@ -17,9 +17,11 @@
 #include <glib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "libfuzzer/libfuzzer_macro.h"
@@ -92,6 +94,14 @@ namespace {
  * downwards, so a single `-device virtio-blk-device` lands at slot 31
  * (0x0a003e00), not slot 0. */
 constexpr uint64_t kVirtioMmioBase = 0x0a003e00ULL;
+
+/* Non-RAM MMIO target for DMA reentrancy / bounce-buffer testing.
+ * PL011 UART @ 0x09000000 on aarch64 virt — always present, safe to
+ * read/write, not directly accessible RAM → forces address_space_map()
+ * through the bounce-buffer path and triggers MMIO read/write side
+ * effects (the DMA reentrancy attack surface, CVE-2024-3446 class). */
+constexpr uint64_t kExoticGpaBase = 0x09000000ULL;
+constexpr uint32_t kExoticGpaSize = 0x1000;
 
 /* virtio-mmio register offsets (modern, version 2) */
 enum : uint64_t {
@@ -250,14 +260,55 @@ void op_guest_mem_write(uint32_t buf_id, const std::string& data) {
 }
 
 void op_vq_add_desc(uint32_t vq_idx, uint32_t buf_id,
-                    uint32_t len, bool device_writable, bool chain_next) {
+                    uint32_t len, bool device_writable, bool chain_next,
+                    uint32_t exotic_region) {
     if (vq_idx >= kMaxQueues) return;
     auto& q = g_state.vqs[vq_idx];
     if (q.size == 0) return;
 
-    auto it = g_state.bufs.find(buf_id);
-    if (it == g_state.bufs.end()) return;
-    const Buf& buf = it->second;
+    uint64_t addr;
+    uint32_t dlen;
+    if (exotic_region != 0) {
+        /* Rotate through 4 MMIO regions to exercise recursive-MMIO reentrancy
+         * (BH Asia 2022: "Recursive MMIO Flaws in QEMU/KVM").
+         * All addresses verified against hw/arm/virt.c base_memmap[]:
+         *
+         *   1 = PL011 UART0  0x09000000..0x09000fff  (size 0x1000)
+         *       virt.c: [VIRT_UART0] = { 0x09000000, 0x00001000 }
+         *   2 = own virtio-mmio (DMA Reflection)  kVirtioMmioBase..+0x1ff
+         *       virt.c: [VIRT_MMIO] = { 0x0a000000, 0x200 } × 32 slots;
+         *               our device is slot 31 = 0x0a003e00
+         *   3 = GIC distributor  0x08000000..0x0800ffff  (size 0x10000)
+         *       virt.c: [VIRT_GIC_DIST] = { 0x08000000, 0x00010000 }
+         *   4 = virtio-mmio bus slots 0..30  0x0a000000..0x0a003dff  (DMA Refraction)
+         *       virt.c: [VIRT_MMIO] = { 0x0a000000, 0x200 } × 32 slots
+         *
+         * Region 2 virtio-mmio register map from
+         * include/standard-headers/linux/virtio_mmio.h
+         * (gpa = kVirtioMmioBase + (buf_id % 128) * 4):
+         *   buf_id=0  → 0x000  VIRTIO_MMIO_MAGIC_VALUE       (R)
+         *   buf_id=17 → 0x044  VIRTIO_MMIO_QUEUE_READY       (RW) ← write 0 → disable queue mid-flight
+         *   buf_id=20 → 0x050  VIRTIO_MMIO_QUEUE_NOTIFY      (W)  ← kick → BH → reentrancy
+         *   buf_id=25 → 0x064  VIRTIO_MMIO_INTERRUPT_ACK     (W)  ← clears interrupt mid-processing
+         *   buf_id=28 → 0x070  VIRTIO_MMIO_STATUS            (RW) ← write 0 → virtio_mmio_soft_reset → UAF!
+         *   buf_id=32 → 0x080  VIRTIO_MMIO_QUEUE_DESC_LOW    (W)  ← corrupts descriptor table pointer
+         *   buf_id=33 → 0x084  VIRTIO_MMIO_QUEUE_DESC_HIGH   (W)  ← corrupts descriptor table pointer (hi)
+         *   buf_id=36 → 0x090  VIRTIO_MMIO_QUEUE_AVAIL_LOW   (W)  ← corrupts avail ring (driver area)
+         *   buf_id=40 → 0x0a0  VIRTIO_MMIO_QUEUE_USED_LOW    (W)  ← corrupts used ring (device area)
+         */
+        const uint64_t bases[4] = {
+            0x09000000ULL, kVirtioMmioBase, 0x08000000ULL, 0x0a000000ULL };
+        const uint32_t sizes[4] = { 0x1000, 0x200, 0x10000, 0x3e00 };
+        uint32_t ri = (exotic_region - 1) % 4;
+        addr = bases[ri] + (buf_id % (sizes[ri] / 4)) * 4;
+        dlen = std::min(len, 4u);
+    } else {
+        auto it = g_state.bufs.find(buf_id);
+        if (it == g_state.bufs.end()) return;
+        const Buf& buf = it->second;
+        addr = buf.gpa;
+        dlen = std::min(len, buf.len);
+    }
 
     uint32_t idx = q.next_desc_idx % q.size;
     uint16_t flags = 0;
@@ -267,8 +318,6 @@ void op_vq_add_desc(uint32_t vq_idx, uint32_t buf_id,
     /* Encode a 16-byte split-virtqueue descriptor:
      *   le64 addr, le32 len, le16 flags, le16 next */
     uint8_t desc[16];
-    uint64_t addr = buf.gpa;
-    uint32_t dlen = std::min(len, buf.len);
     uint16_t next = static_cast<uint16_t>((idx + 1) % q.size);
     std::memcpy(desc + 0,  &addr,  8);
     std::memcpy(desc + 8,  &dlen,  4);
@@ -401,7 +450,8 @@ void dispatch(const qemu::fuzz::blk::VirtioOp& op) {
     case VirtioOp::kVqAddDesc: {
         const auto& d = op.vq_add_desc();
         op_vq_add_desc(d.vq_idx(), d.buf_id(), d.len(),
-                       d.device_writable(), d.chain_next());
+                       d.device_writable(), d.chain_next(),
+                       d.exotic_region());
         break;
     }
     case VirtioOp::kVqKick:
@@ -450,34 +500,45 @@ void proto_fuzz_virtio_blk_run(QTestState* qts,
         }
     } else {
         /*
-         * Interleaved mode (deterministic). For every op in the primary
-         * list, run `iter` ops from the secondary list, cycling. This
-         * lets the proto encode patterns like "write descriptor; mutate
-         * its memory; kick; observe device misread the now-stale data"
-         * fully derived from the input bytes, so libFuzzer crash files
-         * replay byte-for-byte.
+         * Concurrent mode: thread B loops through ops_thread_b while
+         * thread A runs ops.  Both share QEMU's address space; the race
+         * window is between thread A's VqKick (device reads descriptor /
+         * buffer) and thread B's MemwriteAbsolute (mutates the same GPA).
+         * qtest_memwrite is BQL-free so the two writes genuinely overlap.
          *
-         * Real OS-thread concurrency (which would let us catch true
-         * TOCTOU races in BQL-free DMA reads) is intentionally NOT
-         * here -- the user-required determinism contradicts wall-clock-
-         * dependent thread scheduling. If we later want a non-
-         * deterministic mode for true TOCTOU, it goes in a separate
-         * proto field with its own crash-file caveat.
+         * g_state is thread_local, so each thread has independent harness
+         * bookkeeping.  Thread B initialises its own copy with the shared
+         * QTestState* and a disjoint buffer-pool region (upper half) to
+         * avoid GPA collisions with thread A's allocations.
+         *
+         * Crash files are non-deterministic (scheduling-dependent), but
+         * libFuzzer still minimises the input size, which is sufficient
+         * for triage.
          */
-        uint32_t iter  = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 8);
-        int      bsz   = prog.ops_thread_b_size();
-        int      bidx  = 0;
+        QTestState* shared_qts = g_state.qts;
+        constexpr uint64_t kBufPoolMid =
+            kBufPoolBase + (kBufPoolEnd - kBufPoolBase) / 2;
+        uint32_t iter = std::clamp<uint32_t>(prog.thread_b_iter(), 1, 100);
+        int bsz = prog.ops_thread_b_size();
+        std::atomic<bool> b_stop{false};
+
+        std::thread thread_b([&]() {
+            g_state.qts       = shared_qts;
+            g_state.buf_alloc = kBufPoolMid;
+            for (uint32_t i = 0;
+                 i < iter && !b_stop.load(std::memory_order_relaxed); ++i) {
+                for (int j = 0; j < bsz; ++j)
+                    dispatch(prog.ops_thread_b(j));
+            }
+        });
 
         for (const auto& op : prog.ops()) {
             if (n++ >= kMaxOps) break;
             dispatch(op);
-            for (uint32_t i = 0; i < iter; ++i) {
-                if (n++ >= kMaxOps) break;
-                const auto& bop = prog.ops_thread_b(bidx);
-                bidx = (bidx + 1) % bsz;
-                dispatch(bop);
-            }
         }
+
+        b_stop.store(true, std::memory_order_relaxed);
+        thread_b.join();
     }
 }
 

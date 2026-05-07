@@ -110,9 +110,9 @@ LLVM_PREFIX=/your/llvm/prefix ~/qemu-virtio-protofuzz/build.sh ~/qemu
 
 ```sh
 python3 ~/qemu/scripts/oss-fuzz/gen_virtio_net_corpus.py \
-        -o /tmp/corpus_net --clean              # all 26 base seeds
+        -o /tmp/corpus_net --clean
 python3 ~/qemu/scripts/oss-fuzz/gen_virtio_gpu_corpus.py \
-        -o /tmp/corpus_gpu --clean -n 100       # 13 base + 87 perturbations
+        -o /tmp/corpus_gpu --clean -n 100       # base seeds + 87 perturbations
 python3 ~/qemu/scripts/oss-fuzz/gen_virtio_blk_corpus.py \
         -o /tmp/corpus_blk --clean
 ```
@@ -120,6 +120,15 @@ python3 ~/qemu/scripts/oss-fuzz/gen_virtio_blk_corpus.py \
 Each generator writes text-format proto seeds. The harness loads them
 with `LoadProtoInput(binary=false, ...)` so they're directly mutatable
 by LPM at the proto level.
+
+Every generator also emits five **DMA reentrancy seeds** (see
+ARCHITECTURE.md Section 14 and README.md "DMA reentrancy"):
+`seed_dma_reflection`, `seed_dma_all_regions`,
+`seed_dma_reflection_concurrent`, `seed_dma_reset_gadget`, and
+`seed_dma_recursive_notify`. These exercise descriptor chains whose
+buffer GPAs point into virtio-mmio register space instead of DRAM,
+reaching reentrancy and UAF paths that are unreachable from normal
+DRAM buffers.
 
 ## 5. Run
 
