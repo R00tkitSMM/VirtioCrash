@@ -1,0 +1,253 @@
+/*
+ * Structured input grammar for the virtio-gpu LPM fuzzer.
+ *
+ * Beyond the common-virtio op set, this schema is *state-aware*: each
+ * "create"-style op (RESOURCE_CREATE_2D, ATTACH_BACKING) writes its
+ * result into a slot index, and every "use"-style op (SET_SCANOUT,
+ * RESOURCE_FLUSH, TRANSFER_TO_HOST_2D, RESOURCE_UNREF, ...) references a
+ * slot index. The harness keeps a per-iteration table that maps slots to
+ * the values they hold (resource_id, backing GPA, dimensions). At
+ * dispatch time, slot references are resolved through the table -- so
+ * a SET_SCANOUT op that follows a RESOURCE_CREATE_2D in the same input
+ * actually targets the resource that was just created.
+ *
+ * If a slot is referenced before being written, the harness sees an
+ * empty slot and emits zero / an invalid id -- which is also useful
+ * fuzz input ("what does the device do with an unknown resource").
+ *
+ * Layout reference: include/standard-headers/linux/virtio_gpu.h
+ *   queue 0 = control queue
+ *   queue 1 = cursor queue
+ */
+
+syntax = "proto3";
+package qemu.fuzz.gpu;
+
+/* ---- common-virtio ops (mirrors blk/net schemas) ---- */
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+/*
+ * Fault-injection primitive: write `data` to a fixed GPA (clamped to
+ * the harness's reserved DRAM pool). Used in interleaved mode so a
+ * secondary op list can mutate memory regions that primary GPU ops
+ * have placed descriptors / blob backing at.
+ */
+message MemwriteAbsolute {
+  uint64 gpa  = 1;
+  bytes  data = 2;
+}
+
+/*
+ * MmioCorrupt -- write to an arbitrary offset inside the virtio-mmio
+ * window. Register-decoder fault injection.
+ */
+message MmioCorrupt {
+  uint32 offset = 1;
+  uint32 value  = 2;
+  uint32 size   = 3;     /* 1, 2, or 4 (default) */
+}
+
+/* ---- virtio-gpu device-aware commands ---- */
+
+/*
+ * RESOURCE_CREATE_2D: allocate a 2D resource. resource_id is GUEST-
+ * assigned (unlike many other devices). The harness picks the next
+ * fresh id and writes it into resource_slot for later ops to use.
+ */
+message GpuResourceCreate2D {
+  uint32 resource_slot = 1;     // 0..15
+  uint32 format        = 2;     // VIRTIO_GPU_FORMAT_*
+  uint32 width         = 3;
+  uint32 height        = 4;
+}
+
+/* RESOURCE_UNREF: free a slot's resource. */
+message GpuResourceUnref {
+  uint32 resource_slot = 1;
+}
+
+/*
+ * RESOURCE_ATTACH_BACKING: link a resource to one or more guest memory
+ * pages. The harness allocates `num_entries` × `entry_size` bytes in
+ * DRAM and emits a SG list of that shape. The backing GPA + size is
+ * stashed in a backing_slot for later DETACH / TRANSFER ops.
+ */
+message GpuResourceAttachBacking {
+  uint32 resource_slot = 1;
+  uint32 backing_slot  = 2;     // 0..15: where to remember the backing
+  uint32 num_entries   = 3;     // 1..16
+  uint32 entry_size    = 4;     // up to 4096
+  bytes  fill          = 5;     // optional: bytes to write into backing
+                                 // (cycled if shorter than total size)
+}
+
+/* RESOURCE_DETACH_BACKING: release backing, but slot stays. */
+message GpuResourceDetachBacking {
+  uint32 resource_slot = 1;
+}
+
+/*
+ * TRANSFER_TO_HOST_2D: copy `width x height` from backing+offset into
+ * the resource at (x, y). Has been a recurring source of OOB reads
+ * upstream when w/h/offset don't agree with the resource shape.
+ */
+message GpuTransferToHost2D {
+  uint32 resource_slot = 1;
+  uint32 x             = 2;
+  uint32 y             = 3;
+  uint32 width         = 4;
+  uint32 height        = 5;
+  uint64 offset        = 6;
+}
+
+/* RESOURCE_FLUSH: composite the resource's region to its scanouts. */
+message GpuResourceFlush {
+  uint32 resource_slot = 1;
+  uint32 x             = 2;
+  uint32 y             = 3;
+  uint32 width         = 4;
+  uint32 height        = 5;
+}
+
+/* SET_SCANOUT: bind a resource region to a scanout (display). */
+message GpuSetScanout {
+  uint32 scanout_id    = 1;     // 0..max_scanouts-1
+  uint32 resource_slot = 2;     // 0 means "disable scanout"
+  uint32 x             = 3;
+  uint32 y             = 4;
+  uint32 width         = 5;
+  uint32 height        = 6;
+}
+
+/* GET_DISPLAY_INFO: response holds num_scanouts entries of geometry. */
+message GpuGetDisplayInfo {}
+
+/* GET_EDID: response holds the EDID blob for one scanout. */
+message GpuGetEdid {
+  uint32 scanout_id = 1;
+}
+
+/*
+ * UPDATE_CURSOR (cursor queue, vq 1): bind a small resource as the
+ * cursor at (x, y).
+ */
+message GpuUpdateCursor {
+  uint32 scanout_id    = 1;
+  uint32 x             = 2;
+  uint32 y             = 3;
+  uint32 resource_slot = 4;
+  uint32 hot_x         = 5;
+  uint32 hot_y         = 6;
+}
+
+/* MOVE_CURSOR (cursor queue, vq 1): hardware cursor pos update. */
+message GpuMoveCursor {
+  uint32 scanout_id = 1;
+  uint32 x          = 2;
+  uint32 y          = 3;
+}
+
+/*
+ * Set the harness's "fence state" used to decorate subsequent ops.
+ * When `enabled`, the next outgoing ctrl_hdr is built with
+ * VIRTIO_GPU_FLAG_FENCE in flags and the supplied fence_id field.
+ * Persists until the next GpuSetFenceState. Useful for fuzzing the
+ * device's fence-tracking and completion-signaling paths, which had
+ * UAF history (CVE-2017-13672 family).
+ */
+message GpuSetFenceState {
+  bool   enabled  = 1;
+  uint64 fence_id = 2;
+  uint32 ctx_id   = 3;     /* ignored unless 3D context features are on */
+}
+
+/*
+ * RESOURCE_CREATE_BLOB (modern, VIRTIO_GPU_F_RESOURCE_BLOB): a typed
+ * resource backed by a host-visible memory region.
+ * Wire format:
+ *   ctrl_hdr (24)
+ *   le32 resource_id, le32 blob_mem, le32 blob_flags, le32 nr_entries
+ *   le64 blob_id, le64 size
+ *   nr_entries * { le64 addr, le32 length, le32 padding }
+ */
+message GpuResourceCreateBlob {
+  uint32 resource_slot = 1;     /* 0..15: store the new resource_id */
+  uint32 blob_mem      = 2;     /* VIRTIO_GPU_BLOB_MEM_GUEST/HOST3D/HOST3D_GUEST */
+  uint32 blob_flags    = 3;     /* USE_MAPPABLE/SHAREABLE/CROSS_DEVICE */
+  uint64 blob_id       = 4;     /* virgl-side opaque id */
+  uint64 size          = 5;
+  uint32 num_entries   = 6;     /* SG entries */
+  uint32 entry_size    = 7;
+}
+
+/*
+ * Ask QEMU to resize a virtio-gpu console. Triggers
+ * virtio_gpu_set_scanout-style reconfiguration internally and a
+ * config-change interrupt. Hits the display-hotplug path.
+ */
+message HostHotplugScanout {
+  uint32 console_index = 1;     /* qemu_console_lookup_by_index */
+  uint32 width         = 2;
+  uint32 height        = 3;
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    GpuResourceCreate2D       gpu_create_2d         = 13;
+    GpuResourceUnref          gpu_resource_unref    = 14;
+    GpuResourceAttachBacking  gpu_attach_backing    = 15;
+    GpuResourceDetachBacking  gpu_detach_backing    = 16;
+    GpuTransferToHost2D       gpu_transfer_to_host  = 17;
+    GpuResourceFlush          gpu_resource_flush    = 18;
+    GpuSetScanout             gpu_set_scanout       = 19;
+    GpuGetDisplayInfo         gpu_get_display_info  = 20;
+    GpuGetEdid                gpu_get_edid          = 21;
+    GpuUpdateCursor           gpu_update_cursor     = 22;
+    GpuMoveCursor             gpu_move_cursor       = 23;
+
+    GpuSetFenceState          gpu_set_fence_state   = 24;
+    GpuResourceCreateBlob     gpu_create_blob       = 25;
+    HostHotplugScanout        host_hotplug_scanout  = 26;
+
+    /* fault injection */
+    MemwriteAbsolute          mem_write_absolute    = 27;
+    MmioCorrupt               mmio_corrupt          = 28;
+  }
+}
+
+message VirtioGpuProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

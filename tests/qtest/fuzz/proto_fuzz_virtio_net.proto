@@ -1,0 +1,227 @@
+/*
+ * Structured input grammar for the virtio-net LPM fuzzer.
+ *
+ * Same common-virtio op surface as the virtio-blk schema, plus two
+ * device-aware convenience messages:
+ *
+ *   TxPacket -- emits a virtio_net_hdr (12 B) + payload as a 2-descriptor
+ *               chain on a TX queue, bumps the avail ring, and rings the
+ *               doorbell.
+ *
+ *   CtrlCmd  -- emits a control queue command as a 3-descriptor chain on
+ *               the CVQ:  [class+cmd header (out) | data (out) | ack (in)].
+ *               The CVQ is the highest-CVE surface of virtio-net (filter
+ *               management, RSS config, MAC set, multi-queue, etc.).
+ */
+
+syntax = "proto3";
+package qemu.fuzz.net;
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+/*
+ * Fault-injection primitive: write `data` to a fixed GPA inside the
+ * harness's reserved DRAM pool. Lets the proto interleave memory
+ * mutations between virtio operations so the device can be made to
+ * read stale-then-fresh data on consecutive accesses (a deterministic
+ * stand-in for true TOCTOU). The address is clamped into the pool at
+ * dispatch time.
+ */
+message MemwriteAbsolute {
+  uint64 gpa  = 1;
+  bytes  data = 2;
+}
+
+/*
+ * MmioCorrupt -- write to an arbitrary offset inside the virtio-mmio
+ * window. Reaches reserved / unimplemented / RO offsets that typed
+ * ops never touch. Register-decoder fault injection.
+ */
+message MmioCorrupt {
+  uint32 offset = 1;
+  uint32 value  = 2;
+  uint32 size   = 3;     /* 1, 2, or 4 (default) */
+}
+
+/*
+ * Modern virtio_net_hdr layout (12 bytes, with VIRTIO_F_VERSION_1):
+ *   u8  flags
+ *   u8  gso_type
+ *   u16 hdr_len
+ *   u16 gso_size
+ *   u16 csum_start
+ *   u16 csum_offset
+ *   u16 num_buffers
+ */
+message TxPacket {
+  uint32 vq_idx      = 1;   // typically a TX queue (1, 3, 5, ...)
+  uint32 hdr_flags   = 2;   // VIRTIO_NET_HDR_F_*
+  uint32 gso_type    = 3;   // VIRTIO_NET_HDR_GSO_*
+  uint32 hdr_len     = 4;
+  uint32 gso_size    = 5;
+  uint32 csum_start  = 6;
+  uint32 csum_offset = 7;
+  uint32 num_buffers = 8;
+  bytes  payload     = 9;   // ethernet frame (or fragment); device parses
+  /*
+   * 802.1Q VLAN tag. When non-zero the harness inserts a 4-byte tag
+   * (TPID 0x8100, low 16 bits = TCI) between the src MAC and the
+   * EtherType field of `payload`. Lets LPM produce VLAN-tagged frames
+   * without packing the bytes itself.
+   */
+  uint32 vlan_tci    = 10;
+}
+
+/*
+ * Host-side action: simulate a netdev link transition. Calls the
+ * monitor-level qmp_set_link("<netdev_id>", up). The virtio-net device
+ * sees a link-status change and (with VIRTIO_NET_F_STATUS) updates its
+ * config-space status bit + raises a config-change interrupt.
+ */
+message HostSetLink {
+  bool up = 1;
+}
+
+/*
+ * Raw-bytes CTRL command, kept as an escape hatch so LPM can produce
+ * payloads that don't match any of our typed classes (forwards
+ * compatibility for new VIRTIO_NET_CTRL_* introduced upstream).
+ *
+ *   u8 vclass     -- VIRTIO_NET_CTRL_RX/_MAC/_VLAN/_ANNOUNCE/_MQ/_GUEST_OFFLOADS/_NOTF_COAL/...
+ *   u8 cmd
+ *   bytes data    -- per-class payload
+ *   1B ack        -- device response, written into a writable descriptor
+ */
+message CtrlCmd {
+  uint32 vq_idx = 1;
+  uint32 vclass = 2;
+  uint32 cmd    = 3;
+  bytes  data   = 4;
+}
+
+/*
+ * --- Typed CVQ commands (device-aware payloads) --------------------------
+ *
+ * Each one models a specific {vclass, cmd, payload} tuple from the
+ * virtio-net spec. The harness packs the payload from the typed fields,
+ * which keeps LPM mutations inside per-class semantics instead of
+ * mutating opaque bytes that often turn out invalid for any class.
+ *
+ * Many of these also feed into the harness's per-iteration NetState
+ * (the "state-aware" part):
+ *
+ *   CtrlMqVqPairsSet  -> active_pairs                 (consumed by TxPacket)
+ *   CtrlMacAddrSet    -> current_mac                  (informational)
+ *   CtrlMacTableSet   -> mac_list_slots[macs_slot]    (referenced by future ops)
+ *   CtrlVlanAdd       -> vlan_slots[vlan_slot] := vid (referenced by Del)
+ *
+ * Slot-keyed messages let later ops symbolically reference results
+ * produced by earlier ops in the same input.
+ */
+
+message CtrlRx          { uint32 cmd = 1; uint32 enable = 2; }
+message CtrlMacAddrSet  { bytes  mac = 1; }
+message CtrlMacTableSet {
+  uint32         macs_slot      = 1;     // 0..3
+  repeated bytes unicast_macs   = 2;
+  repeated bytes multicast_macs = 3;
+}
+message CtrlVlanAdd {
+  uint32 vlan_slot = 1;     // 0..15: where to remember the VID
+  uint32 vid       = 2;
+}
+message CtrlVlanDel {
+  uint32 vlan_slot = 1;     // resolves to a VID stored by an earlier Add
+  bool   use_slot  = 2;     // false = use vid below directly
+  uint32 vid       = 3;
+}
+message CtrlAnnounceAck     {}
+message CtrlMqVqPairsSet    { uint32 pair_count = 1; }
+message CtrlGuestOffloads   { uint64 offloads   = 1; }
+
+/*
+ * VIRTIO_NET_CTRL_RSS_CONFIG payload:
+ *   le32 hash_types
+ *   le16 indirection_table_mask
+ *   le16 unclassified_queue
+ *   indirection_table * le16 (size = mask + 1)
+ *   le16 max_tx_vq
+ *   u8   hash_key_length
+ *   u8[] hash_key
+ *
+ * The harness packs from these typed fields.
+ */
+message CtrlRssConfig {
+  uint32 hash_types               = 1;
+  uint32 indirection_table_mask   = 2;
+  uint32 unclassified_queue       = 3;
+  bytes  indirection_table        = 4;     // raw entries (le16 each)
+  uint32 max_tx_vq                = 5;
+  bytes  hash_key                 = 6;
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+    TxPacket      tx_packet       = 13;
+    CtrlCmd       ctrl_cmd        = 14;     // raw escape hatch
+
+    /* typed CVQ commands */
+    CtrlRx              ctrl_rx              = 20;
+    CtrlMacAddrSet      ctrl_mac_addr_set    = 21;
+    CtrlMacTableSet     ctrl_mac_table_set   = 22;
+    CtrlVlanAdd         ctrl_vlan_add        = 23;
+    CtrlVlanDel         ctrl_vlan_del        = 24;
+    CtrlAnnounceAck     ctrl_announce_ack    = 25;
+    CtrlMqVqPairsSet    ctrl_mq_vq_pairs_set = 26;
+    CtrlGuestOffloads   ctrl_guest_offloads  = 27;
+    CtrlRssConfig       ctrl_rss_config      = 28;
+
+    /* host-side actions */
+    HostSetLink         host_set_link        = 29;
+
+    /* fault injection */
+    MemwriteAbsolute    mem_write_absolute   = 30;
+    MmioCorrupt         mmio_corrupt         = 31;
+  }
+}
+
+message VirtioNetProgram {
+  repeated VirtioOp ops = 1;
+
+  /*
+   * Deterministic interleaving: for every op in `ops`, the harness
+   * runs `thread_b_iter` ops from `ops_thread_b` (cycling through it).
+   * Empty ops_thread_b => sequential single-list mode.
+   */
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

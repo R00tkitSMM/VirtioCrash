@@ -1,0 +1,98 @@
+/*
+ * Structured input grammar for the proto-fuzz-virtio-vsock target.
+ *
+ * vhost-vsock device: queue layout
+ *   vq 0 = RX (host -> guest)
+ *   vq 1 = TX (guest -> host)
+ *   vq 2 = event
+ *
+ * Wire packet (virtio_vsock_hdr, 44 bytes, little-endian):
+ *   le64 src_cid; le64 dst_cid;
+ *   le32 src_port; le32 dst_port;
+ *   le32 len;
+ *   le16 type;       // 1 = STREAM, 2 = DGRAM, 3 = SEQPACKET
+ *   le16 op;         // 1=REQUEST 2=RESPONSE 3=RST 4=SHUTDOWN 5=RW
+ *                    // 6=CREDIT_UPDATE 7=CREDIT_REQUEST
+ *   le32 flags;
+ *   le32 buf_alloc;
+ *   le32 fwd_cnt;
+ *
+ * Note: vhost-vsock-device on QEMU is Linux-only (needs /dev/vhost-vsock).
+ * On macOS the build won't include it; the target still registers but
+ * QEMU launch fails.
+ */
+
+syntax = "proto3";
+package qemu.fuzz.vsock;
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa  = 1; bytes  data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* Typed vsock packet. The harness builds the 44-byte header from
+ * these fields and appends `payload`. */
+message VsockPacket {
+  uint64 src_cid    = 1;
+  uint64 dst_cid    = 2;
+  uint32 src_port   = 3;
+  uint32 dst_port   = 4;
+  uint32 type       = 5;     // 1=STREAM, 2=DGRAM, 3=SEQPACKET
+  uint32 op         = 6;     // 1..7
+  uint32 flags      = 7;
+  uint32 buf_alloc  = 8;
+  uint32 fwd_cnt    = 9;
+  bytes  payload    = 10;
+}
+
+/* TX from the guest direction (vq 1): place packet in an out-only desc. */
+message VsockTx { VsockPacket pkt = 1; }
+
+/* RX-prepared buffer (vq 0): an in-only desc the device can fill. */
+message VsockRxBuf { uint32 size = 1; }
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    VsockTx       vsock_tx        = 20;
+    VsockRxBuf    vsock_rx_buf    = 21;
+
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioVsockProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

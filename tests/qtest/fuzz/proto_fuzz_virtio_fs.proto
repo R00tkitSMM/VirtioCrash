@@ -1,0 +1,256 @@
+/*
+ * Structured input grammar for the proto-fuzz-virtio-fs target.
+ *
+ * virtio-fs in QEMU is vhost-user-only: the device just proxies guest
+ * virtqueue operations to a unix-domain backend over the vhost-user
+ * protocol. This harness ships a *minimal in-process mock backend*
+ * (proto_fuzz_virtio_fs.cc) so QEMU can reach DRIVER_OK without
+ * requiring an external virtiofsd. The fuzz surface that's reachable
+ * is therefore on the QEMU SIDE:
+ *
+ *   - virtio-mmio register decode / queue setup
+ *   - vhost-user message handling and FD passing
+ *   - virtio-fs frontend code that forwards FUSE-shaped descriptor
+ *     chains to the backend
+ *   - DAX-window code paths (when negotiated)
+ *
+ * The grammar mirrors the other proto_fuzz_* targets: common-virtio
+ * ops + a typed FuseRequest message that builds a 2-descriptor chain
+ * (out: fuse_in_header + per-opcode args, in: response buffer) and
+ * kicks the chosen request queue.
+ *
+ * virtio-fs queue layout:
+ *   vq 0 = high-priority queue (FORGET, INTERRUPT, BATCH_FORGET)
+ *   vq 1 = notification queue (FUSE_NOTIFY_*)
+ *   vq 2..N = request queues (everything else)
+ */
+
+syntax = "proto3";
+package qemu.fuzz.fs;
+
+/* --- common-virtio ops --------------------------------------- */
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa  = 1; bytes  data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* --- typed FUSE requests ------------------------------------- */
+
+/*
+ * Common envelope: every FUSE request has a fuse_in_header (40 bytes):
+ *   le32 len, le32 opcode, le64 unique, le64 nodeid,
+ *   le32 uid, le32 gid, le32 pid, le32 padding
+ *
+ * Per-opcode args follow. Then the device fills:
+ *   fuse_out_header (16 bytes): le32 len, le32 error, le64 unique
+ * followed by per-opcode response data.
+ *
+ * The harness packs the fuse_in_header from the typed fields below;
+ * each opcode message contributes only its op-specific args. LPM can
+ * mutate the typed fields independently of the envelope.
+ */
+
+/* FUSE_INIT (opcode=26): mandatory first request. Negotiates major,
+ * minor, max_readahead, flags. */
+message FuseInit {
+  uint32 major          = 1;     // typically 7
+  uint32 minor          = 2;     // 31..38 in modern Linux/QEMU
+  uint32 max_readahead  = 3;
+  uint32 flags          = 4;     // FUSE_ASYNC_READ etc.
+}
+
+/* FUSE_LOOKUP (opcode=1): name-in payload (NUL-terminated). */
+message FuseLookup {
+  bytes name = 1;     // NUL-terminated path component
+}
+
+message FuseGetattr {
+  uint32 getattr_flags = 1;
+  uint64 fh            = 2;
+}
+
+message FuseSetattr {
+  uint32 valid     = 1;     // FATTR_* mask
+  uint64 fh        = 2;
+  uint64 size      = 3;
+  uint64 lock_owner = 4;
+  uint64 atime     = 5;
+  uint64 mtime     = 6;
+  uint64 ctime     = 7;
+  uint32 mode      = 8;
+  uint32 uid       = 9;
+  uint32 gid       = 10;
+}
+
+message FuseOpen {
+  uint32 flags        = 1;
+  uint32 open_flags   = 2;
+}
+
+message FuseRead {
+  uint64 fh           = 1;
+  uint64 offset       = 2;
+  uint32 size         = 3;
+  uint32 read_flags   = 4;
+  uint64 lock_owner   = 5;
+  uint32 flags        = 6;
+}
+
+message FuseWrite {
+  uint64 fh           = 1;
+  uint64 offset       = 2;
+  uint32 size         = 3;
+  uint32 write_flags  = 4;
+  uint64 lock_owner   = 5;
+  uint32 flags        = 6;
+  bytes  data         = 7;
+}
+
+message FuseRelease {
+  uint64 fh           = 1;
+  uint32 flags        = 2;
+  uint32 release_flags = 3;
+  uint64 lock_owner   = 4;
+}
+
+message FuseMkdir {
+  uint32 mode  = 1;
+  uint32 umask = 2;
+  bytes  name  = 3;
+}
+
+message FuseUnlink   { bytes name = 1; }
+message FuseRmdir    { bytes name = 1; }
+message FuseFlush {
+  uint64 fh = 1;
+  uint32 unused = 2;
+  uint32 padding = 3;
+  uint64 lock_owner = 4;
+}
+
+/*
+ * xattr ops have a CVE history (length-handling). FUSE_GETXATTR /
+ * FUSE_SETXATTR / FUSE_LISTXATTR / FUSE_REMOVEXATTR.
+ */
+message FuseGetXattr {
+  uint32 size  = 1;
+  bytes  name  = 2;
+}
+message FuseSetXattr {
+  uint32 flags = 1;
+  bytes  name  = 2;
+  bytes  value = 3;
+}
+message FuseListXattr  { uint32 size = 1; }
+message FuseRemoveXattr { bytes name = 1; }
+
+/*
+ * FUSE_IOCTL: catch-all extension point with op-specific in/out
+ * payload. Recurring source of issues.
+ */
+message FuseIoctl {
+  uint64 fh           = 1;
+  uint32 flags        = 2;
+  uint32 cmd          = 3;
+  uint64 arg          = 4;
+  uint32 in_size      = 5;
+  uint32 out_size     = 6;
+  bytes  in_data      = 7;
+}
+
+/*
+ * Raw escape hatch: arbitrary opcode + payload, for opcodes not in
+ * the typed list (FUSE_BATCH_FORGET, FUSE_FALLOCATE, FUSE_LSEEK, ...).
+ */
+message FuseRaw {
+  uint32 opcode  = 1;
+  bytes  payload = 2;
+  uint32 in_len  = 3;     // requested response buffer size
+}
+
+message FuseRequest {
+  uint32 vq_idx       = 1;     // typically 2 (request queue)
+  uint64 unique       = 2;
+  uint64 nodeid       = 3;
+  uint32 uid          = 4;
+  uint32 gid          = 5;
+  uint32 pid          = 6;
+  uint32 in_buf_size  = 7;     // override response buffer size
+
+  oneof op {
+    FuseInit          init           = 10;
+    FuseLookup        lookup         = 11;
+    FuseGetattr       getattr        = 12;
+    FuseSetattr       setattr        = 13;
+    FuseOpen          open           = 14;
+    FuseRead          read           = 15;
+    FuseWrite         write          = 16;
+    FuseRelease       release        = 17;
+    FuseMkdir         mkdir          = 18;
+    FuseUnlink        unlink         = 19;
+    FuseRmdir         rmdir          = 20;
+    FuseFlush         flush          = 21;
+    FuseGetXattr      getxattr       = 22;
+    FuseSetXattr      setxattr       = 23;
+    FuseListXattr     listxattr      = 24;
+    FuseRemoveXattr   removexattr    = 25;
+    FuseIoctl         ioctl          = 26;
+    FuseRaw           raw            = 27;
+  }
+}
+
+/* High-priority queue (vq 0) op: FORGET / BATCH_FORGET / INTERRUPT.
+ * One descriptor (out only). */
+message FuseHpReq {
+  uint32 opcode  = 1;     // 3=FORGET, 35=BATCH_FORGET, 36=INTERRUPT
+  uint64 unique  = 2;
+  uint64 nodeid  = 3;
+  bytes  payload = 4;
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    FuseRequest   fuse_request    = 20;
+    FuseHpReq     fuse_hp_req     = 21;
+
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioFsProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

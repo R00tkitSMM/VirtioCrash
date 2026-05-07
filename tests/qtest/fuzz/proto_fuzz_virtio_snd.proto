@@ -1,0 +1,159 @@
+/*
+ * Structured input grammar for the proto-fuzz-virtio-snd target.
+ *
+ * virtio-sound queue layout (modern, V1 spec):
+ *   vq 0 = control queue   -- info/set-params/prepare/start/stop/release
+ *   vq 1 = event queue     -- async events back to driver
+ *   vq 2 = TX queue        -- guest -> host PCM data (playback)
+ *   vq 3 = RX queue        -- host -> guest PCM data (capture)
+ *
+ * The control queue carries virtio_snd_hdr-prefixed requests:
+ *   le32 code;            // VIRTIO_SND_R_*
+ *
+ * Each request has its own typed payload. The harness packs the
+ * payload from typed fields below; CtrlRaw is the escape hatch.
+ */
+
+syntax = "proto3";
+package qemu.fuzz.snd;
+
+/* --- common-virtio ops --- */
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa  = 1; bytes  data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* --- virtio-snd typed control commands ---
+ *
+ * Each one models one VIRTIO_SND_R_* opcode + its payload.
+ *
+ * Codes:
+ *   0x0001 R_JACK_INFO
+ *   0x0002 R_JACK_REMAP
+ *   0x0100 R_PCM_INFO
+ *   0x0101 R_PCM_SET_PARAMS
+ *   0x0102 R_PCM_PREPARE
+ *   0x0103 R_PCM_RELEASE
+ *   0x0104 R_PCM_START
+ *   0x0105 R_PCM_STOP
+ *   0x0200 R_CHMAP_INFO
+ */
+
+message SndJackInfo {
+  uint32 start_id = 1;
+  uint32 count    = 2;
+}
+
+message SndJackRemap {
+  uint32 jack_id     = 1;
+  uint32 association = 2;
+  uint32 sequence    = 3;
+}
+
+message SndPcmInfo {
+  uint32 start_id = 1;
+  uint32 count    = 2;
+}
+
+message SndPcmSetParams {
+  uint32 stream_id = 1;
+  uint32 buffer_bytes = 2;
+  uint32 period_bytes = 3;
+  uint32 features  = 4;
+  uint32 channels  = 5;     // 1..8
+  uint32 format    = 6;     // VIRTIO_SND_PCM_FMT_*
+  uint32 rate      = 7;     // VIRTIO_SND_PCM_RATE_*
+}
+
+message SndPcmCmd {
+  uint32 stream_id = 1;
+}
+
+message SndChmapInfo {
+  uint32 start_id = 1;
+  uint32 count    = 2;
+}
+
+/* Free-form control request: any code + bytes payload. */
+message SndCtrlRaw {
+  uint32 code    = 1;
+  bytes  payload = 2;
+  uint32 in_len  = 3;
+}
+
+message SndCtrl {
+  uint32 vq_idx = 1;     // typically 0
+
+  oneof cmd {
+    SndJackInfo      jack_info       = 10;
+    SndJackRemap     jack_remap      = 11;
+    SndPcmInfo       pcm_info        = 12;
+    SndPcmSetParams  pcm_set_params  = 13;
+    SndPcmCmd        pcm_prepare     = 14;
+    SndPcmCmd        pcm_release     = 15;
+    SndPcmCmd        pcm_start       = 16;
+    SndPcmCmd        pcm_stop        = 17;
+    SndChmapInfo     chmap_info      = 18;
+    SndCtrlRaw       raw             = 19;
+  }
+}
+
+/*
+ * PCM XFER message on the TX/RX queue:
+ *   [out: virtio_snd_pcm_xfer { stream_id } | data] [in: virtio_snd_pcm_status]
+ * For TX (vq 2): out = header+samples, in = status
+ * For RX (vq 3): out = header,         in = status+samples
+ */
+message SndPcmXfer {
+  uint32 vq_idx    = 1;     // 2 = TX, 3 = RX
+  uint32 stream_id = 2;
+  bytes  samples   = 3;     // TX direction
+  uint32 in_len    = 4;     // RX/status buffer size
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    SndCtrl       snd_ctrl        = 20;
+    SndPcmXfer    snd_pcm_xfer    = 21;
+
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioSndProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

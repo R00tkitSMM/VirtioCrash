@@ -1,0 +1,297 @@
+/*
+ * Structured input grammar for the virtio-scsi LPM fuzzer.
+ *
+ * virtio-scsi uses a fixed three-queue layout (with optional extras):
+ *
+ *   vq 0  = control queue   -- task management functions, async resets
+ *   vq 1  = event queue     -- async device events back to driver
+ *   vq 2+ = request queue/s -- SCSI commands (CDB + data + sense)
+ *
+ * The on-wire format of a request is well-defined:
+ *
+ *   virtio_scsi_cmd_req {
+ *     u8  lun[8];           // SAM-style LUN
+ *     u64 tag;              // identifier echoed in the response
+ *     u8  task_attr;
+ *     u8  prio;
+ *     u8  crn;
+ *     u8  cdb[CDB_SIZE];    // 32 by default; configurable on the device
+ *   }
+ *   <out> data buffer (WRITE-class CDBs)
+ *   <in>  data buffer (READ-class CDBs)
+ *   virtio_scsi_cmd_resp {
+ *     u32 sense_len;
+ *     u32 resid;
+ *     u16 status_qualifier;
+ *     u8  status;
+ *     u8  response;
+ *     u8  sense[SENSE_SIZE];   // 96 by default
+ *   }
+ *
+ * The harness builds all four buffers and a 3-or-4 descriptor chain on
+ * the chosen request queue. Typed CdbXxx messages let LPM mutate the
+ * SCSI command at the field level (opcode, LBA, length, flags) instead
+ * of as opaque bytes; CdbRaw is the escape hatch for arbitrary opcodes.
+ */
+
+syntax = "proto3";
+package qemu.fuzz.scsi;
+
+/* --- common-virtio ops (mirrors blk/net/gpu) ---------------------- */
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa  = 1; bytes  data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* --- virtio-scsi device-aware messages ---------------------------- */
+
+/*
+ * SCSI LUN encoding in virtio-scsi:
+ *   lun[0] = 1 (always)
+ *   lun[1] = target id (0..255)
+ *   lun[2..3] = encoded LUN (single-level format: 0x40 | (lun & 0x3f), 0)
+ *   lun[4..7] = reserved
+ *
+ * The harness packs this from `target` and `lun`, so LPM mutates the
+ * two ints rather than the 8 bytes.
+ */
+
+/*
+ * Typed CDB messages. Each one models a specific SCSI opcode + the
+ * fields that matter. The harness packs the wire-format CDB bytes from
+ * these typed fields, which keeps mutations inside the CDB grammar
+ * instead of producing junk that the parser rejects in the first few
+ * bytes.
+ */
+
+message CdbInquiry {
+  bool   evpd      = 1;       // bit 0 of byte 1
+  uint32 page_code = 2;
+  uint32 alloc_len = 3;
+}
+
+message CdbTestUnitReady {}
+
+message CdbReadCapacity10 {
+  uint32 lba   = 1;
+  bool   pmi   = 2;
+}
+
+message CdbReadCapacity16 {
+  uint64 lba   = 1;
+  uint32 alloc_len = 2;
+  bool   pmi   = 3;
+}
+
+message CdbRead10 {
+  bool   dpo = 1;
+  bool   fua = 2;
+  uint32 lba = 3;
+  uint32 transfer_len = 4;
+  uint32 group = 5;
+}
+
+message CdbWrite10 {
+  bool   dpo = 1;
+  bool   fua = 2;
+  uint32 lba = 3;
+  uint32 transfer_len = 4;
+  uint32 group = 5;
+  bytes  data = 6;
+}
+
+message CdbRead16 {
+  bool   dpo = 1;
+  bool   fua = 2;
+  uint64 lba = 3;
+  uint32 transfer_len = 4;
+  uint32 group = 5;
+}
+
+message CdbWrite16 {
+  bool   dpo = 1;
+  bool   fua = 2;
+  uint64 lba = 3;
+  uint32 transfer_len = 4;
+  uint32 group = 5;
+  bytes  data = 6;
+}
+
+/*
+ * MODE_SENSE_6 / MODE_SENSE_10. Long history of bug surface: page
+ * length parsing, sub-page handling, control byte bits.
+ */
+message CdbModeSense6 {
+  bool   dbd       = 1;
+  uint32 pc        = 2;        // 0=current, 1=changeable, 2=default, 3=saved
+  uint32 page_code = 3;
+  uint32 subpage   = 4;
+  uint32 alloc_len = 5;
+}
+
+message CdbModeSelect6 {
+  bool   pf      = 1;
+  bool   sp      = 2;
+  uint32 param_len = 3;
+  bytes  parameters = 4;
+}
+
+message CdbRequestSense {
+  bool   desc      = 1;
+  uint32 alloc_len = 2;
+}
+
+/*
+ * REPORT_LUNS: returns the device's LUN list. Exercises the
+ * report-luns reply formatter; CVE history around buffer-length
+ * handling.
+ */
+message CdbReportLuns {
+  uint32 select_report = 1;     // 0..2
+  uint32 alloc_len     = 2;
+}
+
+message CdbStartStopUnit {
+  bool   immed   = 1;
+  uint32 power   = 2;           // power condition modifier
+  bool   loej    = 3;
+  bool   start   = 4;
+}
+
+message CdbReadDiscInfo {
+  uint32 data_type = 1;
+  uint32 alloc_len = 2;
+}
+
+message CdbSynchronizeCache10 {
+  bool   immed = 1;
+  uint32 lba   = 2;
+  uint32 num_blocks = 3;
+}
+
+/*
+ * Catch-all: arbitrary CDB bytes. Lets LPM produce CDBs for opcodes
+ * we don't have typed coverage for (vendor-specific, write-same,
+ * extended copy, persistent reservation, etc).
+ */
+message CdbRaw {
+  bytes cdb_bytes = 1;     // up to 32; right-truncated/padded
+  bytes out_data  = 2;     // optional WRITE-class data
+  uint32 in_len   = 3;     // requested READ-class buffer length
+}
+
+/*
+ * Submit one of the typed CDBs as a virtio-scsi request on the
+ * specified queue. target/lun pick the LUN; tag is just an opaque
+ * identifier.
+ */
+message ScsiCmd {
+  uint32 vq_idx  = 1;     // typically 2 or higher (request queues)
+  uint32 target  = 2;     // 0..255
+  uint32 lun     = 3;     // 0..63 in single-level format
+  uint64 tag     = 4;
+  uint32 task_attr = 5;
+  uint32 prio    = 6;
+  uint32 crn     = 7;
+
+  oneof cdb {
+    CdbInquiry            inquiry            = 10;
+    CdbTestUnitReady      test_unit_ready    = 11;
+    CdbReadCapacity10     read_capacity_10   = 12;
+    CdbReadCapacity16     read_capacity_16   = 13;
+    CdbRead10             read_10            = 14;
+    CdbWrite10            write_10           = 15;
+    CdbRead16             read_16            = 16;
+    CdbWrite16            write_16           = 17;
+    CdbModeSense6         mode_sense_6       = 18;
+    CdbModeSelect6        mode_select_6      = 19;
+    CdbRequestSense       request_sense      = 20;
+    CdbReportLuns         report_luns        = 21;
+    CdbStartStopUnit      start_stop_unit    = 22;
+    CdbSynchronizeCache10 sync_cache_10      = 23;
+    CdbRaw                raw                = 24;
+  }
+}
+
+/*
+ * Task-management request on the control queue (vq 0):
+ *
+ *   virtio_scsi_ctrl_tmf_req {
+ *     u32 type;
+ *     u32 subtype;
+ *     u8  lun[8];
+ *     u64 tag;
+ *   }
+ *   virtio_scsi_ctrl_tmf_resp { u8 response; }
+ *
+ * Common subtypes: ABORT_TASK, ABORT_TASK_SET, CLEAR_ACA,
+ * CLEAR_TASK_SET, I_T_NEXUS_RESET, LUN_RESET, QUERY_TASK,
+ * QUERY_TASK_SET.
+ */
+message TmfReq {
+  uint32 subtype = 1;
+  uint32 target  = 2;
+  uint32 lun     = 3;
+  uint64 tag     = 4;
+}
+
+/*
+ * Async-notification subscription on the control queue (type=AN_QUERY
+ * or AN_SUBSCRIBE). Drives the async event delivery state machine.
+ */
+message AnReq {
+  uint32 subtype          = 1;     // 1 = AN_QUERY, 2 = AN_SUBSCRIBE
+  uint32 target           = 2;
+  uint32 lun              = 3;
+  uint32 event_requested  = 4;     // bitmask
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    /* device-aware */
+    ScsiCmd       scsi_cmd        = 20;
+    TmfReq        tmf_req         = 21;
+    AnReq         an_req          = 22;
+
+    /* fault injection */
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioScsiProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

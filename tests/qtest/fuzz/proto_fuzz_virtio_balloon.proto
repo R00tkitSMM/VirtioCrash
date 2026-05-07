@@ -1,0 +1,92 @@
+/*
+ * Structured input grammar for proto-fuzz-virtio-balloon.
+ *
+ * virtio-balloon queues:
+ *   vq 0 = inflate (driver -> device)
+ *   vq 1 = deflate (driver -> device)
+ *   vq 2 = stats   (optional, VIRTIO_BALLOON_F_STATS_VQ)
+ *   vq 3 = free-page-hint (optional, VIRTIO_BALLOON_F_FREE_PAGE_HINT)
+ *   vq 4 = reporting (optional, VIRTIO_BALLOON_F_REPORTING)
+ *
+ * Inflate/deflate payloads are arrays of u32 PFNs. Stats payload is
+ * an array of virtio_balloon_stat (u16 tag + u64 val).
+ */
+
+syntax = "proto3";
+package qemu.fuzz.balloon;
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1; uint32 buf_id = 2; uint32 len = 3;
+  bool   device_writable = 4; bool chain_next = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa = 1; bytes data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* Send N PFNs on the inflate queue (driver giving up pages). */
+message Inflate {
+  repeated uint32 pfns = 1;
+}
+
+/* Send N PFNs on the deflate queue (driver getting pages back). */
+message Deflate {
+  repeated uint32 pfns = 1;
+}
+
+/* Submit a stats blob. Each stat is (tag, value); the device parses
+ * pairs out of the buffer. */
+message StatsEntry {
+  uint32 tag = 1;
+  uint64 value = 2;
+}
+message Stats {
+  repeated StatsEntry entries = 1;
+}
+
+/* virtio-balloon free-page-hint cmd_id: drives the free-page-hint
+ * state machine. */
+message FreePageCmd {
+  uint32 cmd_id = 1;       /* VIRTIO_BALLOON_CMD_ID_* */
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+
+    Inflate     inflate     = 20;
+    Deflate     deflate     = 21;
+    Stats       stats       = 22;
+    FreePageCmd free_page   = 23;
+
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioBalloonProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}

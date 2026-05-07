@@ -1,0 +1,109 @@
+/*
+ * Structured input grammar for the virtio-blk LPM fuzzer.
+ *
+ * Each VirtioOp models one operation a guest virtio-mmio driver would
+ * perform: feature negotiation, virtqueue setup, descriptor placement,
+ * doorbell. A VirtioBlkProgram is a sequence of these.
+ *
+ * Buffers are referred to by buf_id; the harness allocates a fresh GPA
+ * inside guest DRAM for each GuestMemWrite and remembers the mapping
+ * for the lifetime of one fuzz iteration.
+ */
+
+syntax = "proto3";
+package qemu.fuzz.blk;
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }    // 0 = clear; nonzero = OR into status
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1;
+  uint32 buf_id = 2;
+  uint32 len    = 3;
+  bool   device_writable = 4;
+  bool   chain_next      = 5;   // last desc in a chain when false
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+/*
+ * MemwriteAbsolute -- write `data` to a fixed guest physical address.
+ * Bypasses the per-thread `bufs` slot table, so thread A and thread B
+ * (in multi-thread mode) can mutate the SAME GPA without coordination
+ * through harness state. This is the TOCTOU primitive: thread A places
+ * a descriptor pointing at GPA X, thread A kicks the device, thread B
+ * MemwriteAbsolute(X, ...) races against the device's read of GPA X.
+ *
+ * Bounded to the harness's reserved DRAM region (kBufPoolBase ..
+ * kBufPoolEnd) at dispatch time so the address can't escape into MMIO
+ * regions or the QEMU machine init area.
+ */
+message MemwriteAbsolute {
+  uint64 gpa  = 1;
+  bytes  data = 2;
+}
+
+/*
+ * MmioCorrupt -- write `value` to virtio-mmio register at `offset`
+ * within the device's MMIO window. Unlike the typed ops which only
+ * touch a known set of well-formed registers, this can hit reserved
+ * / unimplemented / write-only-from-spec offsets. Common bug surface
+ * (driver-untrusted register decoders).
+ *
+ *   size: 1 -> writeb, 2 -> writew, 4 -> writel (default), other ->
+ *   writel.
+ */
+message MmioCorrupt {
+  uint32 offset = 1;     // 0..0x1ff inside virtio-mmio[0]
+  uint32 value  = 2;
+  uint32 size   = 3;
+}
+
+message VirtioOp {
+  oneof op {
+    GetFeatures      get_features      = 1;
+    SetFeatures      set_features      = 2;
+    ConfigRead       config_read       = 3;
+    ConfigWrite      config_write      = 4;
+    VqSelect         vq_select         = 5;
+    VqSetup          vq_setup          = 6;
+    SetStatus        set_status        = 7;
+    GuestMemWrite    guest_mem_write   = 8;
+    VqAddDesc        vq_add_desc       = 9;
+    VqKick           vq_kick           = 10;
+    VqWaitUsed       vq_wait_used      = 11;
+    Reset            reset             = 12;
+    MemwriteAbsolute mem_write_absolute = 13;
+    MmioCorrupt      mmio_corrupt       = 14;
+  }
+}
+
+/*
+ * The fuzz input. `ops` is the primary thread's command list (the one
+ * libFuzzer's TestOneInput is called on). When `ops_thread_b` is non-
+ * empty, the harness spawns a second pthread that runs that list
+ * `thread_b_iter` times in a tight loop, in parallel with the primary
+ * thread. The harness joins thread B before returning to libFuzzer.
+ *
+ * All harness bookkeeping (vqs[], bufs, buf_alloc) is thread_local, so
+ * the two threads share only QEMU's address space (DRAM + MMIO). The
+ * race window we want is between a primary-thread VqKick triggering
+ * QEMU's device handler (which reads a descriptor / a buffer) and
+ * thread B's MemwriteAbsolute mutating the same GPA. qtest_memwrite
+ * is BQL-free, so the device handler and thread B's writes can
+ * genuinely overlap on the same memory.
+ *
+ * Sequential testing: leave ops_thread_b empty.
+ */
+message VirtioBlkProgram {
+  repeated VirtioOp ops = 1;
+
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;       // 0 means "run once"; clamped at 100
+}

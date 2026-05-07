@@ -1,0 +1,71 @@
+/*
+ * Structured input grammar for proto-fuzz-virtio-input.
+ *
+ * virtio-input layout:
+ *   vq 0 = event queue (host -> guest)
+ *   vq 1 = status queue (guest -> host)
+ *
+ * Status messages are virtio_input_event (8 bytes, evdev-style):
+ *   le16 type, le16 code, le32 value
+ *
+ * Common evdev types: 1=EV_KEY, 2=EV_REL, 3=EV_ABS, 0x14=EV_REP.
+ */
+
+syntax = "proto3";
+package qemu.fuzz.input;
+
+message GetFeatures   {}
+message SetFeatures   { uint64 features = 1; }
+message ConfigRead    { uint32 offset = 1; uint32 size = 2; }
+message ConfigWrite   { uint32 offset = 1; bytes  data = 2; }
+message VqSelect      { uint32 vq_idx = 1; }
+message VqSetup       { uint32 vq_idx = 1; uint32 size = 2; }
+message SetStatus     { uint32 bits   = 1; }
+message GuestMemWrite { uint32 buf_id = 1; bytes data = 2; }
+message VqAddDesc {
+  uint32 vq_idx = 1; uint32 buf_id = 2; uint32 len = 3;
+  bool   device_writable = 4; bool chain_next = 5;
+}
+message VqKick     { uint32 vq_idx = 1; }
+message VqWaitUsed { uint32 vq_idx = 1; }
+message Reset      {}
+
+message MemwriteAbsolute { uint64 gpa = 1; bytes data = 2; }
+message MmioCorrupt      { uint32 offset = 1; uint32 value = 2; uint32 size = 3; }
+
+/* Send a status-queue event (guest -> host). LEDs and similar. */
+message StatusEvent {
+  uint32 type  = 1;
+  uint32 code  = 2;
+  uint32 value = 3;
+}
+
+/* Stage an in-buffer on the event queue (host -> guest). */
+message EventBuf { uint32 size = 1; }
+
+message VirtioOp {
+  oneof op {
+    GetFeatures   get_features    = 1;
+    SetFeatures   set_features    = 2;
+    ConfigRead    config_read     = 3;
+    ConfigWrite   config_write    = 4;
+    VqSelect      vq_select       = 5;
+    VqSetup       vq_setup        = 6;
+    SetStatus     set_status      = 7;
+    GuestMemWrite guest_mem_write = 8;
+    VqAddDesc     vq_add_desc     = 9;
+    VqKick        vq_kick         = 10;
+    VqWaitUsed    vq_wait_used    = 11;
+    Reset         reset           = 12;
+    StatusEvent   status_event    = 20;
+    EventBuf      event_buf       = 21;
+    MemwriteAbsolute mem_write_absolute = 30;
+    MmioCorrupt      mmio_corrupt       = 31;
+  }
+}
+
+message VirtioInputProgram {
+  repeated VirtioOp ops = 1;
+  repeated VirtioOp ops_thread_b = 2;
+  uint32 thread_b_iter = 3;
+}
